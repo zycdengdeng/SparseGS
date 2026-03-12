@@ -13,7 +13,10 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
-from guidance.sd_utils import StableDiffusion
+try:
+    from guidance.sd_utils import StableDiffusion
+except Exception:
+    pass
 import math
 from torchmetrics import PearsonCorrCoef
 import matplotlib.pyplot as plt

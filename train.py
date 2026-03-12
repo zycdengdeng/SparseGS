@@ -6,7 +6,11 @@ import math
 import cv2
 import diptest
 from icecream import ic
-from guidance.sd_utils import StableDiffusion
+try:
+    from guidance.sd_utils import StableDiffusion
+    SD_AVAILABLE = True
+except Exception:
+    SD_AVAILABLE = False
 from random import randint
 from utils.loss_utils import l1_loss, ssim, local_pearson_loss, pearson_depth_loss, mask_l1_loss
 from utils.prune_utils import calc_diff
@@ -61,6 +65,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     print(prune_sched)
 
     if dataset.lambda_diffusion:
+        if not SD_AVAILABLE:
+            raise RuntimeError("StableDiffusion requires diffusers compatible with your PyTorch version. "
+                               "Either upgrade PyTorch>=2.4 or set --lambda_diffusion 0")
         guidance_sd = StableDiffusion(device="cuda")
         guidance_sd.get_text_embeds([""], [""])
         print(f"[INFO] loaded SD!")
