@@ -354,7 +354,7 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     pipe = pipeline_params.extract(args)
-    output_dir = args.output_dir or args.model_path
+    output_dir = getattr(args, 'output_dir', None) or args.model_path
 
     render_vehicle_cameras(
         model_path=args.model_path,
