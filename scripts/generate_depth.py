@@ -25,7 +25,8 @@ import glob
 import numpy as np
 from pathlib import Path
 
-def generate_with_depth_anything_v2(input_dir, output_dir, model_size='vits'):
+def generate_with_depth_anything_v2(input_dir, output_dir, model_size='vits',
+                                     depth_anything_path=None):
     """Generate depth maps using Depth Anything V2."""
     try:
         import torch
@@ -35,13 +36,41 @@ def generate_with_depth_anything_v2(input_dir, output_dir, model_size='vits'):
         print("PyTorch or OpenCV not available")
         return False
 
+    # Try to import Depth Anything V2 from multiple locations
+    DepthAnythingV2 = None
+
+    # 1. Try direct import (if installed or already on sys.path)
     try:
-        # Try to import Depth Anything V2
         from depth_anything_v2.dpt import DepthAnythingV2
     except ImportError:
-        print("Depth Anything V2 not installed. Install with:")
-        print("  pip install depth-anything-v2")
-        print("  Or clone: git clone https://github.com/DepthAnything/Depth-Anything-V2")
+        pass
+
+    # 2. Try from --depth_anything_path or common locations
+    if DepthAnythingV2 is None:
+        search_paths = []
+        if depth_anything_path:
+            search_paths.append(depth_anything_path)
+        # Common clone locations relative to SparseGS
+        sparsegs_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        search_paths.extend([
+            os.path.join(sparsegs_root, 'Depth-Anything-V2'),
+            os.path.join(os.path.dirname(sparsegs_root), 'Depth-Anything-V2'),
+            os.path.expanduser('~/Depth-Anything-V2'),
+        ])
+        for p in search_paths:
+            if os.path.isdir(p) and os.path.exists(os.path.join(p, 'depth_anything_v2')):
+                sys.path.insert(0, p)
+                try:
+                    from depth_anything_v2.dpt import DepthAnythingV2
+                    print(f"  Found Depth Anything V2 at: {p}")
+                    break
+                except ImportError:
+                    sys.path.pop(0)
+
+    if DepthAnythingV2 is None:
+        print("Depth Anything V2 not found. Clone it to a sibling directory:")
+        print("  cd /mnt/zyc_wzh && git clone https://github.com/DepthAnything/Depth-Anything-V2")
+        print("  Or specify path: --depth_anything_path /path/to/Depth-Anything-V2")
         return False
 
     # Model configs
@@ -59,12 +88,26 @@ def generate_with_depth_anything_v2(input_dir, output_dir, model_size='vits'):
     print(f"Using device: {device}")
 
     model = DepthAnythingV2(**model_configs[model_size])
-    # Try to load pretrained weights
-    weight_path = f'checkpoints/depth_anything_v2_{model_size}.pth'
-    if os.path.exists(weight_path):
+    # Try to load pretrained weights from multiple locations
+    sparsegs_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    weight_candidates = [
+        os.path.join(sparsegs_root, 'checkpoints', f'depth_anything_v2_{model_size}.pth'),
+        f'checkpoints/depth_anything_v2_{model_size}.pth',
+    ]
+    if depth_anything_path:
+        weight_candidates.insert(0, os.path.join(depth_anything_path, f'depth_anything_v2_{model_size}.pth'))
+
+    weight_path = None
+    for wp in weight_candidates:
+        if os.path.exists(wp):
+            weight_path = wp
+            break
+
+    if weight_path:
         model.load_state_dict(torch.load(weight_path, map_location='cpu'))
+        print(f"  Loaded weights: {weight_path}")
     else:
-        print(f"Weights not found at {weight_path}")
+        print(f"Weights not found. Download to checkpoints/depth_anything_v2_{model_size}.pth")
         print("Download from: https://github.com/DepthAnything/Depth-Anything-V2#pretrained-models")
         return False
 
@@ -211,6 +254,8 @@ def main():
                         help='Depth Anything model size')
     parser.add_argument('--depth_maps_dir', type=str, default=None,
                         help='LiDAR depth PNGs directory (for lidar_convert method)')
+    parser.add_argument('--depth_anything_path', type=str, default=None,
+                        help='Path to cloned Depth-Anything-V2 repo (e.g., /mnt/zyc_wzh/Depth-Anything-V2)')
 
     args = parser.parse_args()
 
@@ -224,7 +269,8 @@ def main():
     if args.method == 'auto':
         # Try methods in order of preference
         print("\n[Trying] Depth Anything V2...")
-        success = generate_with_depth_anything_v2(args.input, args.output, args.model_size)
+        success = generate_with_depth_anything_v2(args.input, args.output, args.model_size,
+                                                   args.depth_anything_path)
 
         if not success:
             print("\n[Trying] BoostingMonocularDepth...")
@@ -243,7 +289,8 @@ def main():
             success = generate_simple_depth_from_distance(None, args.input, args.output)
 
     elif args.method == 'depth_anything':
-        success = generate_with_depth_anything_v2(args.input, args.output, args.model_size)
+        success = generate_with_depth_anything_v2(args.input, args.output, args.model_size,
+                                                   args.depth_anything_path)
 
     elif args.method == 'boosting':
         success = generate_with_boosting_monodepth(args.input, args.output)
