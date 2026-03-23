@@ -97,8 +97,16 @@ def generate_with_boosting_monodepth(input_dir, output_dir):
     sys.path.insert(0, sparsegs_root)
 
     try:
-        from BoostingMonocularDepth.prepare_depth import prepare_gt_depth
-        prepare_gt_depth(input_folder=input_dir, save_folder=output_dir)
+        # BoostingMonocularDepth's run.py creates its own argparse and reads
+        # sys.argv, which conflicts with our --output/--input args.
+        # Temporarily replace sys.argv to avoid the conflict.
+        saved_argv = sys.argv
+        sys.argv = [sys.argv[0]]
+        try:
+            from BoostingMonocularDepth.prepare_depth import prepare_gt_depth
+            prepare_gt_depth(input_folder=input_dir, save_folder=output_dir)
+        finally:
+            sys.argv = saved_argv
         return True
     except Exception as e:
         print(f"BoostingMonocularDepth failed: {e}")
