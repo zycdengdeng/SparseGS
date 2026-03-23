@@ -335,10 +335,11 @@ def locate_raw_data(raw_dataset_root, scene_num, timestamp):
     scene_folder = find_scene_folder(raw_dataset_root, scene_num)
     print(f"  Scene folder: {scene_folder}")
 
-    # Calibration file - may be at scene root or in road/
+    # Calibration file - may be at scene root, in road/, or shared in support_info/
     calib_candidates = [
         os.path.join(scene_folder, "calib.json"),
         os.path.join(scene_folder, "road", "calib.json"),
+        os.path.join(raw_dataset_root, "support_info", "calib.json"),
     ]
     calib_path = None
     for c in calib_candidates:
@@ -346,7 +347,10 @@ def locate_raw_data(raw_dataset_root, scene_num, timestamp):
             calib_path = c
             break
     if calib_path is None:
-        raise FileNotFoundError(f"calib.json not found in {scene_folder}")
+        raise FileNotFoundError(
+            f"calib.json not found in {scene_folder}. "
+            f"Use --calib to specify the path manually."
+        )
 
     # PCD file - in road/lidar/merged_pcd/ or scene root
     ts = str(timestamp)
@@ -434,6 +438,8 @@ def main():
     parser.add_argument('--output', type=str, required=True,
                         help='Output directory (e.g., data/car_road/scene053)')
     # Options
+    parser.add_argument('--calib', type=str, default=None,
+                        help='Override path to calib.json (e.g., /mnt/car_road_data_TianJin/support_info/calib.json)')
     parser.add_argument('--no_filter_visible', action='store_true',
                         help='Keep all points (including invisible ones)')
     parser.add_argument('--min_depth', type=float, default=0.5,
@@ -459,6 +465,12 @@ def main():
         data_paths = locate_raw_data(args.raw_dataset, args.scene, timestamp)
     else:
         data_paths = locate_self_dataset(args.self_dataset, timestamp)
+
+    # Override calib path if specified
+    if args.calib:
+        if not os.path.exists(args.calib):
+            raise FileNotFoundError(f"Specified calib file not found: {args.calib}")
+        data_paths['calib_json'] = args.calib
 
     print(f"  Calib: {data_paths['calib_json']}")
     print(f"  PCD:   {data_paths['pcd']}")
