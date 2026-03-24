@@ -104,7 +104,7 @@ def generate_with_depth_anything_v2(input_dir, output_dir, model_size='vits',
             break
 
     if weight_path:
-        model.load_state_dict(torch.load(weight_path, map_location='cpu'))
+        model.load_state_dict(torch.load(weight_path, map_location='cpu', weights_only=True))
         print(f"  Loaded weights: {weight_path}")
     else:
         print(f"Weights not found. Download to checkpoints/depth_anything_v2_{model_size}.pth")
