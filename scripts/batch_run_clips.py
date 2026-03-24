@@ -451,8 +451,8 @@ def main():
     parser.add_argument("--clip_filter", type=str, nargs="+", default=None,
                         help="Only run these clip names (e.g., 088_car0402_road0402_t70)")
     parser.add_argument("--position_filter", type=str, nargs="+", default=None,
-                        choices=["near", "mid", "far"],
-                        help="Only run these positions (default: all three)")
+                        choices=["near", "mid", "far", "middle"],
+                        help="Only run these positions (default: all three). 'middle' is alias for 'mid'.")
     parser.add_argument("--gpu_id", type=int, default=0,
                         help="GPU device ID")
     parser.add_argument("--depth_method", type=str, default="auto",
@@ -465,8 +465,12 @@ def main():
 
     args = parser.parse_args()
 
-    positions = args.position_filter or ["near", "mid", "far"]
+    # Normalize "middle" -> "mid" for internal use (CLIPS dict uses "mid")
+    raw_positions = args.position_filter or ["near", "mid", "far"]
+    positions = ["mid" if p == "middle" else p for p in raw_positions]
     position_labels = {"near": "近路", "mid": "路中", "far": "路远"}
+    # Directory name mapping: mid -> middle for clarity
+    position_dir_names = {"near": "near", "mid": "middle", "far": "far"}
 
     # Filter clips if requested
     clips = CLIPS
@@ -516,10 +520,11 @@ def main():
             print(f"  Timestamp: {timestamp}")
             print(f"{'=' * 70}")
 
-            # Directory paths
-            scene_dir = os.path.join(args.data_root, f"{clip_name}_{pos}")
-            model_dir = os.path.join(args.output_root, f"{clip_name}_{pos}")
-            render_dir = os.path.join(model_dir, f"vehicle_render_{pos}")
+            # Directory paths: scene{NNN}_{near|middle|far}
+            pos_dir = position_dir_names[pos]
+            scene_dir = os.path.join(args.data_root, f"scene{scene_num}_{pos_dir}")
+            model_dir = os.path.join(args.output_root, f"scene{scene_num}_{pos_dir}")
+            render_dir = os.path.join(model_dir, f"vehicle_render_{pos_dir}")
 
             task_ok = True
 
