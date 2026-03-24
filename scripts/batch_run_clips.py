@@ -20,6 +20,10 @@ Usage:
   python scripts/batch_run_clips.py --raw_dataset /mnt/car_road_data_TianJin \
     --stages prepare depth
 
+  # Parallel training: 6 jobs concurrently on one GPU (~80GB VRAM)
+  python scripts/batch_run_clips.py --raw_dataset /mnt/car_road_data_TianJin \
+    --stages train --parallel 6
+
   # Dry run (print commands without executing)
   python scripts/batch_run_clips.py --raw_dataset /mnt/car_road_data_TianJin --dry_run
 """
@@ -30,7 +34,10 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # ==============================================================================
@@ -288,22 +295,251 @@ def find_closest_label_json(labels_dir, target_timestamp):
     return best_path
 
 
-def run_cmd(cmd, dry_run=False, cwd=None):
+def run_cmd(cmd, dry_run=False, cwd=None, live_output=True):
     """Run a shell command, print it, and check return code."""
     cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
     print(f"\n  $ {cmd_str}")
     if dry_run:
         return True
 
-    result = subprocess.run(
-        cmd_str, shell=True, cwd=cwd,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-    )
+    if live_output:
+        # Stream output directly so user can see tqdm progress bars
+        result = subprocess.run(
+            cmd_str, shell=True, cwd=cwd,
+        )
+    else:
+        result = subprocess.run(
+            cmd_str, shell=True, cwd=cwd,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
     if result.returncode != 0:
         print(f"  [FAILED] Return code: {result.returncode}")
-        print(result.stdout[-2000:] if len(result.stdout) > 2000 else result.stdout)
+        if not live_output and result.stdout:
+            print(result.stdout[-2000:] if len(result.stdout) > 2000 else result.stdout)
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Parallel training support
+# ---------------------------------------------------------------------------
+
+def _parse_iteration_from_log(log_path):
+    """Parse latest iteration from a training log file.
+
+    Looks for patterns like '[ITER 1234]' or 'Training progress:  42%|' or
+    tqdm-style output.
+    """
+    if not os.path.exists(log_path):
+        return 0, 0  # current_iter, total_iter
+
+    try:
+        # Read last 4KB of log (sufficient for recent progress)
+        with open(log_path, 'rb') as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 4096))
+            tail = f.read().decode('utf-8', errors='replace')
+    except OSError:
+        return 0, 0
+
+    current = 0
+    total = 30000  # default
+
+    # Match "[ITER 1234]"
+    for m in re.finditer(r'\[ITER\s+(\d+)\]', tail):
+        current = max(current, int(m.group(1)))
+
+    # Match tqdm-style "  42%|" or iteration count in postfix
+    # tqdm prints like: " 42%|████      | 12600/30000 [..."
+    for m in re.finditer(r'(\d+)/(\d+)\s*\[', tail):
+        iter_cur, iter_tot = int(m.group(1)), int(m.group(2))
+        if iter_cur > current:
+            current = iter_cur
+            total = iter_tot
+
+    # Match percentage " 42%|"
+    for m in re.finditer(r'\s+(\d+)%\|', tail):
+        pct = int(m.group(1))
+        estimated = int(total * pct / 100)
+        if estimated > current:
+            current = estimated
+
+    return current, total
+
+
+def _make_progress_bar(current, total, width=30):
+    """Render a text progress bar."""
+    if total <= 0:
+        return "[waiting...]"
+    frac = min(current / total, 1.0)
+    filled = int(width * frac)
+    bar = "█" * filled + "░" * (width - filled)
+    pct = frac * 100
+    return f"|{bar}| {current}/{total} ({pct:.0f}%)"
+
+
+def _print_parallel_dashboard(jobs, log_dir):
+    """Print a live dashboard of parallel training jobs."""
+    lines = []
+    for task_id, info in jobs.items():
+        status = info.get("status", "pending")
+        log_path = os.path.join(log_dir, f"{task_id.replace('/', '_')}.log")
+
+        if status == "done":
+            lines.append(f"  ✓ {task_id:<45s} DONE")
+        elif status == "failed":
+            lines.append(f"  ✗ {task_id:<45s} FAILED")
+        elif status == "running":
+            cur, tot = _parse_iteration_from_log(log_path)
+            bar = _make_progress_bar(cur, tot)
+            lines.append(f"  ▶ {task_id:<45s} {bar}")
+        else:
+            lines.append(f"  · {task_id:<45s} queued")
+
+    # Count stats
+    n_done = sum(1 for v in jobs.values() if v["status"] == "done")
+    n_fail = sum(1 for v in jobs.values() if v["status"] == "failed")
+    n_run = sum(1 for v in jobs.values() if v["status"] == "running")
+    n_total = len(jobs)
+
+    header = f"  Parallel Training: {n_done} done, {n_fail} failed, {n_run} running, {n_total} total"
+
+    # Use carriage return / ANSI escape to overwrite
+    # Move cursor up by len(lines)+2 lines
+    n_lines = len(lines) + 2
+    sys.stdout.write(f"\033[{n_lines}A\033[J")  # move up and clear
+    print(header)
+    print("  " + "-" * 68)
+    for line in lines:
+        print(line)
+    sys.stdout.flush()
+
+
+def _run_train_job(task_id, cmd_str, log_path, jobs_dict, lock):
+    """Run a single training command, writing output to log file."""
+    with lock:
+        jobs_dict[task_id]["status"] = "running"
+
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    with open(log_path, 'w') as logf:
+        proc = subprocess.Popen(
+            cmd_str, shell=True,
+            stdout=logf, stderr=subprocess.STDOUT,
+        )
+        proc.wait()
+
+    with lock:
+        if proc.returncode == 0:
+            jobs_dict[task_id]["status"] = "done"
+        else:
+            jobs_dict[task_id]["status"] = "failed"
+
+    return proc.returncode == 0
+
+
+def run_parallel_training(task_list, parallel, gpu_id, dry_run=False):
+    """Run multiple training tasks in parallel with a live dashboard.
+
+    Args:
+        task_list: list of dicts with keys: task_id, source_dir, model_dir
+        parallel: max concurrent jobs
+        gpu_id: GPU device ID
+        dry_run: if True, only print commands
+
+    Returns:
+        (success_list, failed_list)
+    """
+    p = TRAIN_PARAMS
+    log_dir = "logs/parallel_train"
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Build commands
+    jobs = OrderedDict()
+    cmds = {}
+    for task in task_list:
+        tid = task["task_id"]
+        jobs[tid] = {"status": "pending"}
+        cmd = (
+            f"CUDA_VISIBLE_DEVICES={gpu_id} python3 train.py"
+            f" --source_path {task['source_dir']}"
+            f" --model_path {task['model_dir']}"
+            f" -r 1"
+            f" --iterations {p['iterations']}"
+            f" --lambda_dssim {p['lambda_dssim']}"
+            f" --beta {p['beta']}"
+            f" --lambda_pearson {p['lambda_pearson']}"
+            f" --lambda_local_pearson {p['lambda_local_pearson']}"
+            f" --box_p {p['box_p']}"
+            f" --p_corr {p['p_corr']}"
+            f" --lambda_reg {p['lambda_reg']}"
+            f" --lambda_diffusion {p['lambda_diffusion']}"
+            f" --prune_sched {p['prune_sched']}"
+            f" --save_iterations {p['save_iterations']}"
+            f" --test_iterations {p['test_iterations']}"
+            f" --densify_from_iter {p['densify_from_iter']}"
+            f" --densify_until_iter {p['densify_until_iter']}"
+            f" --densify_grad_threshold {p['densify_grad_threshold']}"
+            f" --opacity_reset_interval {p['opacity_reset_interval']}"
+            f" --percent_dense {p['percent_dense']}"
+        )
+        cmds[tid] = cmd
+
+    if dry_run:
+        print(f"\n  [DRY RUN] Would run {len(task_list)} jobs, {parallel} at a time:")
+        for tid, cmd in cmds.items():
+            print(f"\n  $ {cmd}")
+            log_path = os.path.join(log_dir, f"{tid.replace('/', '_')}.log")
+            print(f"    -> log: {log_path}")
+        return list(cmds.keys()), []
+
+    # Print initial dashboard placeholder
+    print(f"\n  Parallel training: {len(task_list)} jobs, {parallel} concurrent on GPU {gpu_id}")
+    print(f"  Logs: {log_dir}/")
+    print()
+    # Print placeholder lines for dashboard
+    for _ in range(len(jobs) + 2):
+        print()
+
+    lock = threading.Lock()
+    success_list = []
+    failed_list = []
+
+    def _worker(tid):
+        log_path = os.path.join(log_dir, f"{tid.replace('/', '_')}.log")
+        return tid, _run_train_job(tid, cmds[tid], log_path, jobs, lock)
+
+    # Dashboard updater thread
+    stop_event = threading.Event()
+
+    def _dashboard_loop():
+        while not stop_event.is_set():
+            try:
+                _print_parallel_dashboard(jobs, log_dir)
+            except Exception:
+                pass
+            stop_event.wait(timeout=5)
+
+    dash_thread = threading.Thread(target=_dashboard_loop, daemon=True)
+    dash_thread.start()
+
+    with ThreadPoolExecutor(max_workers=parallel) as executor:
+        futures = {executor.submit(_worker, tid): tid for tid in cmds}
+        for future in as_completed(futures):
+            tid, ok = future.result()
+            if ok:
+                success_list.append(tid)
+            else:
+                failed_list.append(tid)
+
+    stop_event.set()
+    dash_thread.join(timeout=2)
+
+    # Final dashboard
+    _print_parallel_dashboard(jobs, log_dir)
+    print()
+
+    return success_list, failed_list
 
 
 def stage_prepare(clip_name, timestamp, raw_dataset, output_dir, dry_run=False):
@@ -462,6 +698,9 @@ def main():
                         help="Print commands without executing")
     parser.add_argument("--continue_on_error", action="store_true",
                         help="Continue with next task if current one fails")
+    parser.add_argument("--parallel", type=int, default=1,
+                        help="Number of training jobs to run concurrently (default: 1). "
+                             "Set to 6 to run 2 scenes x 3 positions in parallel on a large GPU.")
 
     args = parser.parse_args()
 
@@ -493,6 +732,8 @@ def main():
     print(f"  Data root:  {args.data_root}")
     print(f"  Output root:{args.output_root}")
     print(f"  GPU:        {args.gpu_id}")
+    if args.parallel > 1:
+        print(f"  Parallel:   {args.parallel} concurrent training jobs")
     if args.dry_run:
         print(f"  *** DRY RUN - no commands will be executed ***")
     print("=" * 70)
@@ -501,80 +742,102 @@ def main():
     failed_tasks = []
     start_time = time.time()
 
+    # Build the full list of (clip_info, pos, task_id, scene_dir, model_dir, ...)
+    all_tasks = []
     for clip_idx, clip_info in enumerate(clips):
         clip_name = clip_info["clip"]
         scene_num = get_scene_number(clip_name)
-
         for pos in positions:
             cam_ts = clip_info[pos]
             cam_id, timestamp = parse_cam_timestamp(cam_ts)
-
-            task_id = f"{clip_name}/{pos}"
-            task_num = clip_idx * len(positions) + positions.index(pos) + 1
-
-            print(f"\n{'=' * 70}")
-            print(f"[{task_num}/{total_tasks}] {task_id}")
-            print(f"  Clip:      {clip_name} (scene {scene_num})")
-            print(f"  Position:  {position_labels[pos]} ({pos})")
-            print(f"  Camera:    cam{cam_id}")
-            print(f"  Timestamp: {timestamp}")
-            print(f"{'=' * 70}")
-
-            # Directory paths: scene{NNN}_{near|middle|far}
             pos_dir = position_dir_names[pos]
+            task_id = f"{clip_name}/{pos}"
             scene_dir = os.path.join(args.data_root, f"scene{scene_num}_{pos_dir}")
             model_dir = os.path.join(args.output_root, f"scene{scene_num}_{pos_dir}")
             render_dir = os.path.join(model_dir, f"vehicle_render_{pos_dir}")
+            all_tasks.append({
+                "clip_info": clip_info,
+                "clip_name": clip_name,
+                "scene_num": scene_num,
+                "pos": pos,
+                "cam_id": cam_id,
+                "timestamp": timestamp,
+                "task_id": task_id,
+                "scene_dir": scene_dir,
+                "model_dir": model_dir,
+                "render_dir": render_dir,
+            })
 
-            task_ok = True
+    use_parallel_train = args.parallel > 1 and "train" in args.stages
 
-            # Stage 1: Prepare
-            if "prepare" in args.stages:
-                print(f"\n  [Stage 1/4] Data Preparation")
-                ok = stage_prepare(clip_name, timestamp, args.raw_dataset,
-                                   scene_dir, dry_run=args.dry_run)
-                if not ok:
-                    task_ok = False
-                    if not args.continue_on_error:
-                        print(f"  [ABORT] Prepare failed for {task_id}")
-                        failed_tasks.append(task_id)
-                        results["failed"] += 1
-                        continue
+    # ---- Sequential stages: prepare, depth (always sequential) ----
+    sequential_stages = [s for s in args.stages if s not in ("train",)] if use_parallel_train else args.stages
+    train_candidates = []  # tasks that pass prepare+depth and need training
 
-            # Stage 2: Depth
-            if "depth" in args.stages and task_ok:
-                print(f"\n  [Stage 2/4] Depth Estimation")
-                ok = stage_depth(scene_dir, args.depth_method, dry_run=args.dry_run)
-                if not ok:
-                    task_ok = False
-                    if not args.continue_on_error:
-                        print(f"  [ABORT] Depth failed for {task_id}")
-                        failed_tasks.append(task_id)
-                        results["failed"] += 1
-                        continue
+    for task_num, task in enumerate(all_tasks, 1):
+        task_id = task["task_id"]
 
-            # Stage 3: Train
-            if "train" in args.stages and task_ok:
-                print(f"\n  [Stage 3/4] Training SparseGS")
-                ok = stage_train(scene_dir, model_dir, args.gpu_id,
-                                 dry_run=args.dry_run)
-                if not ok:
-                    task_ok = False
-                    if not args.continue_on_error:
-                        print(f"  [ABORT] Training failed for {task_id}")
-                        failed_tasks.append(task_id)
-                        results["failed"] += 1
-                        continue
+        print(f"\n{'=' * 70}")
+        print(f"[{task_num}/{total_tasks}] {task_id}")
+        print(f"  Clip:      {task['clip_name']} (scene {task['scene_num']})")
+        print(f"  Position:  {position_labels[task['pos']]} ({task['pos']})")
+        print(f"  Camera:    cam{task['cam_id']}")
+        print(f"  Timestamp: {task['timestamp']}")
+        print(f"{'=' * 70}")
 
-            # Stage 4: Render
-            if "render" in args.stages and task_ok:
-                print(f"\n  [Stage 4/4] Ego-Vehicle Rendering")
-                ok = stage_render(model_dir, clip_name, timestamp, pos,
-                                  args.raw_dataset, render_dir, args.gpu_id,
-                                  dry_run=args.dry_run)
-                if not ok:
-                    task_ok = False
+        task_ok = True
 
+        # Stage 1: Prepare
+        if "prepare" in sequential_stages:
+            print(f"\n  [Stage 1/4] Data Preparation")
+            ok = stage_prepare(task["clip_name"], task["timestamp"], args.raw_dataset,
+                               task["scene_dir"], dry_run=args.dry_run)
+            if not ok:
+                task_ok = False
+                if not args.continue_on_error:
+                    print(f"  [ABORT] Prepare failed for {task_id}")
+                    failed_tasks.append(task_id)
+                    results["failed"] += 1
+                    continue
+
+        # Stage 2: Depth
+        if "depth" in sequential_stages and task_ok:
+            print(f"\n  [Stage 2/4] Depth Estimation")
+            ok = stage_depth(task["scene_dir"], args.depth_method, dry_run=args.dry_run)
+            if not ok:
+                task_ok = False
+                if not args.continue_on_error:
+                    print(f"  [ABORT] Depth failed for {task_id}")
+                    failed_tasks.append(task_id)
+                    results["failed"] += 1
+                    continue
+
+        # Stage 3: Train (sequential mode)
+        if "train" in sequential_stages and task_ok:
+            print(f"\n  [Stage 3/4] Training SparseGS")
+            ok = stage_train(task["scene_dir"], task["model_dir"], args.gpu_id,
+                             dry_run=args.dry_run)
+            if not ok:
+                task_ok = False
+                if not args.continue_on_error:
+                    print(f"  [ABORT] Training failed for {task_id}")
+                    failed_tasks.append(task_id)
+                    results["failed"] += 1
+                    continue
+
+        # Stage 4: Render (sequential mode)
+        if "render" in sequential_stages and task_ok:
+            print(f"\n  [Stage 4/4] Ego-Vehicle Rendering")
+            ok = stage_render(task["model_dir"], task["clip_name"], task["timestamp"],
+                              task["pos"], args.raw_dataset, task["render_dir"],
+                              args.gpu_id, dry_run=args.dry_run)
+            if not ok:
+                task_ok = False
+
+        if use_parallel_train and task_ok:
+            # Collect for parallel training later
+            train_candidates.append(task)
+        elif not use_parallel_train:
             if task_ok:
                 results["success"] += 1
                 print(f"\n  [OK] {task_id} completed")
@@ -582,6 +845,46 @@ def main():
                 results["failed"] += 1
                 failed_tasks.append(task_id)
                 print(f"\n  [FAILED] {task_id}")
+
+    # ---- Parallel training stage ----
+    if use_parallel_train and train_candidates:
+        print(f"\n{'=' * 70}")
+        print(f"PARALLEL TRAINING: {len(train_candidates)} jobs, {args.parallel} concurrent")
+        print(f"{'=' * 70}")
+
+        train_task_list = [
+            {"task_id": t["task_id"], "source_dir": t["scene_dir"], "model_dir": t["model_dir"]}
+            for t in train_candidates
+        ]
+
+        success_ids, failed_ids = run_parallel_training(
+            train_task_list, args.parallel, args.gpu_id, dry_run=args.dry_run
+        )
+
+        # Now run render for successful training jobs (sequentially)
+        if "render" in args.stages:
+            print(f"\n{'=' * 70}")
+            print(f"RENDERING: {len(success_ids)} trained scenes")
+            print(f"{'=' * 70}")
+            for task in train_candidates:
+                if task["task_id"] in success_ids:
+                    print(f"\n  [Render] {task['task_id']}")
+                    ok = stage_render(task["model_dir"], task["clip_name"],
+                                      task["timestamp"], task["pos"],
+                                      args.raw_dataset, task["render_dir"],
+                                      args.gpu_id, dry_run=args.dry_run)
+                    if ok:
+                        results["success"] += 1
+                    else:
+                        results["failed"] += 1
+                        failed_tasks.append(task["task_id"] + "/render")
+                else:
+                    results["success"] += 1
+        else:
+            results["success"] += len(success_ids)
+
+        results["failed"] += len(failed_ids)
+        failed_tasks.extend(failed_ids)
 
     # Summary
     elapsed = time.time() - start_time
