@@ -25,7 +25,14 @@ import numpy as np
 import torch.nn as nn
 
 
-pearson = PearsonCorrCoef().cuda()
+# Lazy init: avoid allocating GPU memory at import time (needed for parallel training)
+_pearson = None
+
+def get_pearson():
+    global _pearson
+    if _pearson is None:
+        _pearson = PearsonCorrCoef().cuda()
+    return _pearson
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
