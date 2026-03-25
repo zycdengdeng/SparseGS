@@ -598,74 +598,52 @@ def stage_train(source_dir, model_dir, gpu_id=0, dry_run=False):
 
 
 def stage_render(model_dir, clip_name, timestamp, position, raw_dataset,
-                 render_output_dir, gpu_id=0, dry_run=False):
-    """Stage 4: Render ego-vehicle viewpoint.
+                 render_output_dir, gpu_id=0, dry_run=False,
+                 vehicle_calib=None, transform_json_root=None,
+                 render_resolution=None):
+    """Stage 4: Render ego-vehicle viewpoint from trained 3DGS model.
 
-    Locates the ego vehicle in road_labels JSON and renders from its position.
-    The vehicle's (x, y, z, yaw) in road/LiDAR coords is used to construct
-    a virtual camera.
+    Uses render_vehicle.py to render all 7 vehicle cameras at the given timestamp.
     """
-    car_id = CLIP_CAR_IDS.get(clip_name)
-    if not car_id:
-        print(f"    [SKIP] No car ID mapping for {clip_name}")
+    scene_num = get_scene_number(clip_name)
+
+    # Resolve vehicle calibration path
+    if vehicle_calib is None:
+        vehicle_calib = os.path.join(raw_dataset, "support_info", "NoEER705_v3", "camera")
+    if not os.path.isdir(vehicle_calib):
+        print(f"    [SKIP] Vehicle calib not found: {vehicle_calib}")
         return False
 
-    # Find label JSON
-    labels_dir = os.path.join(raw_dataset, clip_name, "road_labels", "interpolation_labels")
-    label_json = find_closest_label_json(labels_dir, timestamp)
-    if label_json is None:
-        print(f"    [SKIP] No label JSON found in {labels_dir}")
+    # Resolve transform JSON path
+    if transform_json_root is None:
+        transform_json_root = os.path.join(raw_dataset, "support_info", "transform_json")
+    transform_json = os.path.join(transform_json_root, scene_num, "world2lidar_transforms.json")
+    if not os.path.isfile(transform_json) and not dry_run:
+        print(f"    [SKIP] Transform JSON not found: {transform_json}")
         return False
 
-    if dry_run:
-        print(f"    Would render: clip={clip_name}, ts={timestamp}, pos={position}, car={car_id}")
-        print(f"    Label JSON: {label_json}")
-        return True
+    # Check model exists
+    if not dry_run:
+        pc_dir = os.path.join(model_dir, "point_cloud")
+        if not os.path.isdir(pc_dir):
+            print(f"    [SKIP] No point_cloud dir in {model_dir}")
+            return False
 
-    # Find ego vehicle in labels
-    vehicle = find_ego_vehicle_in_labels(label_json, car_id)
-    if vehicle is None:
-        print(f"    [SKIP] Car {car_id} not found in {label_json}")
-        return False
+    resolution_args = ""
+    if render_resolution:
+        resolution_args = f" --render_resolution {render_resolution[0]} {render_resolution[1]}"
 
-    print(f"    Ego vehicle: {car_id} at ({vehicle['x']:.1f}, {vehicle['y']:.1f}, {vehicle['z']:.1f}), yaw={vehicle['yaw']:.2f}")
-
-    # Save vehicle info for downstream rendering
-    os.makedirs(render_output_dir, exist_ok=True)
-    vehicle_info = {
-        "clip": clip_name,
-        "position": position,
-        "timestamp": timestamp,
-        "car_id": car_id,
-        "vehicle": vehicle,
-        "model_path": model_dir,
-        "label_json": label_json,
-    }
-    info_path = os.path.join(render_output_dir, "vehicle_info.json")
-    with open(info_path, 'w') as f:
-        json.dump(vehicle_info, f, indent=2)
-    print(f"    Saved vehicle info: {info_path}")
-
-    # Render using render_vehicle.py if vehicle_calib and transform_json are available
-    # Otherwise, use the vehicle position from labels to create virtual cameras
-    #
-    # TODO: Integrate with render_vehicle.py once vehicle calibration paths are confirmed.
-    #       For now, we save the vehicle pose info for manual/custom rendering.
-    #
-    # To render with render_vehicle.py, uncomment:
-    # cmd = (
-    #     f"CUDA_VISIBLE_DEVICES={gpu_id} python3 render_vehicle.py"
-    #     f" --model_path {model_dir}"
-    #     f" --vehicle_calib {vehicle_calib_path}"
-    #     f" --transform_json {transform_json_path}"
-    #     f" --timestamp {timestamp}"
-    #     f" --camera_ids 1 2 3 4 5 6 7"
-    #     f" --render_scale 4"
-    #     f" --output_dir {render_output_dir}"
-    # )
-    # return run_cmd(cmd, dry_run=dry_run)
-
-    return True
+    cmd = (
+        f"CUDA_VISIBLE_DEVICES={gpu_id} python3 render_vehicle.py"
+        f" --model_path {model_dir}"
+        f" --vehicle_calib {vehicle_calib}"
+        f" --transform_json {transform_json}"
+        f" --timestamp {timestamp}"
+        f" --camera_ids 1 2 3 4 5 6 7"
+        f"{resolution_args}"
+        f" --output_dir {render_output_dir}"
+    )
+    return run_cmd(cmd, dry_run=dry_run)
 
 
 def main():
@@ -701,6 +679,13 @@ def main():
     parser.add_argument("--parallel", type=int, default=1,
                         help="Number of training jobs to run concurrently (default: 1). "
                              "Set to 6 to run 2 scenes x 3 positions in parallel on a large GPU.")
+    parser.add_argument("--vehicle_calib", type=str, default=None,
+                        help="Vehicle calibration folder (default: {raw_dataset}/support_info/NoEER705_v3/camera)")
+    parser.add_argument("--transform_json_root", type=str, default=None,
+                        help="Transform JSON root (default: {raw_dataset}/support_info/transform_json)")
+    parser.add_argument("--render_resolution", type=int, nargs=2, default=[1280, 720],
+                        metavar=("WIDTH", "HEIGHT"),
+                        help="Vehicle render resolution (default: 1280 720)")
 
     args = parser.parse_args()
 
@@ -830,7 +815,10 @@ def main():
             print(f"\n  [Stage 4/4] Ego-Vehicle Rendering")
             ok = stage_render(task["model_dir"], task["clip_name"], task["timestamp"],
                               task["pos"], args.raw_dataset, task["render_dir"],
-                              args.gpu_id, dry_run=args.dry_run)
+                              args.gpu_id, dry_run=args.dry_run,
+                              vehicle_calib=args.vehicle_calib,
+                              transform_json_root=args.transform_json_root,
+                              render_resolution=tuple(args.render_resolution))
             if not ok:
                 task_ok = False
 
@@ -872,7 +860,10 @@ def main():
                     ok = stage_render(task["model_dir"], task["clip_name"],
                                       task["timestamp"], task["pos"],
                                       args.raw_dataset, task["render_dir"],
-                                      args.gpu_id, dry_run=args.dry_run)
+                                      args.gpu_id, dry_run=args.dry_run,
+                                      vehicle_calib=args.vehicle_calib,
+                                      transform_json_root=args.transform_json_root,
+                                      render_resolution=tuple(args.render_resolution))
                     if ok:
                         results["success"] += 1
                     else:

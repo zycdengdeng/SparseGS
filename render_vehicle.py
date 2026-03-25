@@ -219,8 +219,14 @@ def find_latest_ply(model_path):
 
 
 def render_vehicle_cameras(model_path, vehicle_calib, transform_json, timestamp_ms,
-                           camera_ids, pipeline, output_dir, render_scale=1):
-    """Main rendering function for vehicle camera viewpoints."""
+                           camera_ids, pipeline, output_dir,
+                           render_scale=1, render_resolution=None):
+    """Main rendering function for vehicle camera viewpoints.
+
+    Args:
+        render_resolution: (width, height) tuple. If set, overrides render_scale
+                          and all cameras are rendered at this resolution.
+    """
 
     # Load trained model from PLY (no optimizer/training_args needed)
     print(f"Loading model from {model_path}")
@@ -253,22 +259,29 @@ def render_vehicle_cameras(model_path, vehicle_calib, transform_json, timestamp_
         K, D, R_cam2lidar, t_cam2lidar, resolution = load_vehicle_camera(
             vehicle_calib, cam_id
         )
-        w, h = resolution
+        orig_w, orig_h = resolution
 
-        # Compute undistorted intrinsics
+        # Compute undistorted intrinsics (at original resolution)
         new_K = compute_undistorted_intrinsics(K, D, cam_id, resolution)
 
-        # Apply render scale
-        if render_scale != 1:
-            w = w // render_scale
-            h = h // render_scale
-            scale_x = w / resolution[0]
-            scale_y = h / resolution[1]
+        # Determine target resolution
+        if render_resolution is not None:
+            w, h = render_resolution
+        elif render_scale != 1:
+            w = orig_w // render_scale
+            h = orig_h // render_scale
+        else:
+            w, h = orig_w, orig_h
+
+        # Scale intrinsics to target resolution
+        if (w, h) != (orig_w, orig_h):
+            scale_x = w / orig_w
+            scale_y = h / orig_h
             new_K = new_K.copy()
             new_K[0, :] *= scale_x
             new_K[1, :] *= scale_y
 
-        # Compute FoV from undistorted intrinsics
+        # Compute FoV from scaled intrinsics
         fx, fy = new_K[0, 0], new_K[1, 1]
         fovx = focal2fov(fx, w)
         fovy = focal2fov(fy, h)
@@ -344,8 +357,11 @@ if __name__ == "__main__":
     parser.add_argument("--camera_ids", type=int, nargs='+',
                         default=[1, 2, 3, 4, 5, 6, 7],
                         help="Vehicle camera IDs to render (default: all 7)")
-    parser.add_argument("--render_scale", type=int, default=4,
-                        help="Downscale factor for rendering resolution (default: 4)")
+    parser.add_argument("--render_scale", type=int, default=1,
+                        help="Downscale factor for rendering resolution (default: 1, no scaling)")
+    parser.add_argument("--render_resolution", type=int, nargs=2, default=None,
+                        metavar=("WIDTH", "HEIGHT"),
+                        help="Target resolution for all cameras (e.g., 1280 720). Overrides --render_scale.")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Output directory (default: model_path)")
     parser.add_argument("--quiet", action="store_true")
@@ -356,6 +372,8 @@ if __name__ == "__main__":
     pipe = pipeline_params.extract(args)
     output_dir = getattr(args, 'output_dir', None) or args.model_path
 
+    render_resolution = tuple(args.render_resolution) if args.render_resolution else None
+
     render_vehicle_cameras(
         model_path=args.model_path,
         vehicle_calib=args.vehicle_calib,
@@ -365,4 +383,5 @@ if __name__ == "__main__":
         pipeline=pipe,
         output_dir=output_dir,
         render_scale=args.render_scale,
+        render_resolution=render_resolution,
     )
